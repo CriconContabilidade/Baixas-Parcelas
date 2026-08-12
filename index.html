@@ -143,8 +143,8 @@ code{background:var(--paper);padding:1px 5px;border-radius:3px;font-family:'IBM 
         <div class="dropzone" id="contasDrop"><div class="big">Arraste o PDF aqui</div><div class="small">Lê sozinho a empresa (CNPJ) do cabeçalho do relatório</div><input type="file" id="contasFile" accept="application/pdf"></div>
       </div>
       <div class="field">
-        <label>Extrato bancário / recebidos (.xlsx)</label>
-        <div class="dropzone" id="extratoDrop"><div class="big">Arraste o Excel aqui</div><div class="small">Precisa de uma coluna "Data" e uma de valor</div><input type="file" id="extratoFile" accept=".xlsx,.xls"></div>
+        <label>Extrato bancário / recebidos (.xlsx, .ofx ou PDF)</label>
+        <div class="dropzone" id="extratoDrop"><div class="big">Arraste o extrato aqui</div><div class="small">Excel com coluna "Data" + valor, .ofx, ou PDF de extrato do Banco do Brasil</div><input type="file" id="extratoFile" accept=".xlsx,.xls,.ofx,application/pdf"></div>
       </div>
     </div>
     <div class="btn-row"><button class="btn" id="processBtn" disabled onclick="processarBaixa()">Processar</button></div>
@@ -214,6 +214,10 @@ function selectModelo(m){
   const drop = document.getElementById("contasDrop");
   drop.classList.remove("done");
   drop.querySelector(".big").textContent = "Arraste o PDF aqui";
+  // o extrato (quando veio de PDF/OFX, que sabe a direção C/D de cada
+  // lançamento) não precisa ser reimportado — só refiltra pela direção
+  // certa do novo modelo (débito p/ Entradas, crédito p/ Saídas/Serviços)
+  if(typeof extratoRawState !== "undefined" && extratoRawState) extratoState = filtrarExtratoPorModelo(extratoRawState);
   checkReady();
 }
 
@@ -483,15 +487,86 @@ async function readExtratoXlsx(file){
     if(typeof r[dataCol]==="number") dt = excelDateToParts(r[dataCol]);
     else dt = brDateToParts(r[dataCol]);
     if(!dt) continue;
-    out.push({data:dt, valor:Math.abs(valor)});
+    out.push({data:dt, valor:Math.abs(valor), tipo:null});
   }
   return out;
 }
 
 /* =========================================================================
+   EXTRATO PDF — "Extrato de conta corrente" do Banco do Brasil (autoatendimento).
+   Cada lançamento tem C (crédito, dinheiro entra) ou D (débito, dinheiro
+   sai) no fim da linha; opcionalmente um saldo depois. Guardamos o tipo
+   pra filtrar depois: Entradas usa débitos (pagamento a fornecedor), Saídas
+   e Serviços usam créditos (recebimento de cliente) — o motor de casamento
+   por soma exata cuida de descartar o que não corresponder a nenhum título,
+   então não precisamos adivinhar quais créditos/débitos são "de verdade".
+   ========================================================================= */
+const EXTRATO_BB_LINE_RE = /^(\d{2}\/\d{2}\/\d{4})\s+\S+\s+\S+\s+\S+\s+(.+?)\s+(\S+)\s+([\d.,]+)\s+([CD])(?:\s+[\d.,]+\s+[CD])?$/;
+async function readExtratoPdfBB(file){
+  const pages = await extractPdfAllLines(file);
+  const allLines = pages.flat();
+  const out = [];
+  allLines.forEach(line=>{
+    if(!/^\d{2}\/\d{2}\/\d{4}/.test(line)) return;
+    if(/Saldo Anterior/i.test(line)) return;
+    const m = line.match(EXTRATO_BB_LINE_RE);
+    if(!m) return;
+    const dt = brDateToParts(m[1]);
+    const valor = parseBRL(m[4]);
+    if(!dt || valor==null) return;
+    out.push({data:dt, valor:Math.abs(valor), tipo:m[5]});
+  });
+  return out;
+}
+/* =========================================================================
+   EXTRATO OFX — formato padrão (o mesmo que a ferramenta "Conversor de
+   Extrato" do Hub gera). OFX de banco costuma ser SGML (tags sem
+   fechamento), então extraímos por regex em vez de tentar parsear como
+   XML de verdade — funciona tanto pra OFX 1.x (SGML) quanto 2.x (XML).
+   TRNAMT negativo = débito (dinheiro sai), positivo = crédito (entra).
+   ========================================================================= */
+function parseDateOFX(s){
+  const m = String(s||"").match(/^(\d{4})(\d{2})(\d{2})/);
+  return m ? {y:+m[1], m:+m[2], d:+m[3]} : null;
+}
+function extractOfxTag(block, tag){
+  const m = block.match(new RegExp(`<${tag}>\\s*([^<\r\n]+)`, "i"));
+  return m ? m[1].trim() : null;
+}
+async function readExtratoOfx(file){
+  const text = await file.text();
+  const blocks = text.match(/<STMTTRN>[\s\S]*?<\/STMTTRN>/gi) || [];
+  const out = [];
+  blocks.forEach(b=>{
+    const dt = parseDateOFX(extractOfxTag(b, "DTPOSTED"));
+    const amtRaw = extractOfxTag(b, "TRNAMT");
+    if(!dt || amtRaw==null) return;
+    const amt = parseFloat(amtRaw.replace(",", "."));
+    if(isNaN(amt) || amt===0) return;
+    out.push({data:dt, valor:Math.abs(amt), tipo: amt<0 ? "D" : "C"});
+  });
+  if(!out.length) throw new Error("Não encontrei nenhum <STMTTRN> nesse arquivo OFX.");
+  return out;
+}
+async function readExtrato(file){
+  const name = file.name||"";
+  if(file.type==="application/pdf" || /\.pdf$/i.test(name)) return readExtratoPdfBB(file);
+  if(/\.ofx$/i.test(name)) return readExtratoOfx(file);
+  return readExtratoXlsx(file);
+}
+function filtrarExtratoPorModelo(entries){
+  // entries sem "tipo" (vieram de xlsx) valem pra qualquer modelo, sem filtro
+  // de direção — mantém o comportamento já validado antes desta mudança.
+  const direcaoEsperada = MODELOS[currentModelo].tipoTitulo==="fornecedor" ? "D" : "C";
+  return entries
+    .filter(e=> e.tipo==null || e.tipo===direcaoEsperada)
+    .map(e=> ({data:e.data, valor:e.valor}));
+}
+
+/* =========================================================================
    FLUXO PRINCIPAL
    ========================================================================= */
-let contasState = null, extratoState = null;
+let contasState = null, extratoState = null, extratoRawState = null;
 wireDropzone("contasDrop","contasFile", async (f,d)=>{
   const status = document.getElementById("mainStatus");
   status.classList.remove("hidden","err"); status.textContent = "Lendo PDF...";
@@ -520,15 +595,16 @@ wireDropzone("contasDrop","contasFile", async (f,d)=>{
 });
 wireDropzone("extratoDrop","extratoFile", async (f,d)=>{
   const status = document.getElementById("mainStatus");
-  status.classList.remove("hidden","err"); status.textContent = "Lendo Excel...";
+  status.classList.remove("hidden","err"); status.textContent = "Lendo extrato...";
   try{
-    extratoState = await readExtratoXlsx(f);
-    if(!extratoState.length) throw new Error("Nenhum lançamento reconhecido nesse Excel.");
-    markDropDone(d, `${f.name} (${extratoState.length} lançamentos)`);
+    extratoRawState = await readExtrato(f);
+    if(!extratoRawState.length) throw new Error("Nenhum lançamento reconhecido nesse arquivo.");
+    extratoState = filtrarExtratoPorModelo(extratoRawState);
+    markDropDone(d, `${f.name} (${extratoRawState.length} lançamentos)`);
     status.classList.add("hidden");
   }catch(err){
     status.classList.add("err"); status.textContent = "Erro: " + err.message;
-    extratoState = null;
+    extratoRawState = null; extratoState = null;
   }
   checkReady();
 });
