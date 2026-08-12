@@ -628,7 +628,9 @@ function renderResult(rows, semExtrato, empresaNome, empresaCnpj){
   const nWarn = rows.filter(r=>r.statusClass==="warn").length;
   const nErr = rows.filter(r=>r.statusClass==="err").length;
 
-  let html = `<div class="section-title">${empresaNome} — ${modelo.txtName}</div>
+  const empInfo = empresasDB[empresaCnpj];
+  const empLabel = empInfo ? `${empresaNome} — Cód. Empresa ${empInfo.codigo}` : empresaNome;
+  let html = `<div class="section-title">${empLabel} — ${modelo.txtName}</div>
   <div class="summary-row">
     <div class="item"><div class="k">Linhas</div><div class="v">${rows.length}</div></div>
     <div class="item"><div class="k">OK</div><div class="v">${nOk}</div></div>
