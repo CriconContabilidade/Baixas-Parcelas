@@ -649,6 +649,11 @@ function buildRow(titulo, dataBaixa, statusClass, statusText){
     juros:0, multa:0, desconto:0, pis:0, cofins:0, csll:0, irrf:0,
     statusClass: cls, statusText: txt,
     codigo: titulo.codigo,
+    // título sem correspondência no extrato ainda não tem uma baixa de
+    // verdade acontecendo — não entra no arquivo por padrão. O usuário
+    // marca a caixinha se quiser incluir mesmo assim (ex: preencheu a
+    // data/valor manualmente).
+    incluir: statusText !== "Sem correspondência no extrato",
   };
 }
 
@@ -697,33 +702,42 @@ function findBestMatch(nome, db){
 /* =========================================================================
    RENDER — tabela de revisão editável + downloads
    ========================================================================= */
+let lastResultCtx = null;
 function renderResult(rows, semExtrato, empresaNome, empresaCnpj){
+  lastResultCtx = {semExtrato, empresaNome, empresaCnpj};
   const box = document.getElementById("resultCard");
   box.classList.remove("hidden");
   const modelo = MODELOS[currentModelo];
   const nOk = rows.filter(r=>r.statusClass===null || r.statusClass===undefined).length;
   const nWarn = rows.filter(r=>r.statusClass==="warn").length;
   const nErr = rows.filter(r=>r.statusClass==="err").length;
+  const nIncluir = rows.filter(r=>r.incluir).length;
 
   const empInfo = empresasDB[empresaCnpj];
   const empLabel = empInfo ? `${empresaNome} — Cód. Empresa ${empInfo.codigo}` : empresaNome;
   let html = `<div class="section-title">${empLabel} — ${modelo.txtName}</div>
   <div class="summary-row">
     <div class="item"><div class="k">Linhas</div><div class="v">${rows.length}</div></div>
+    <div class="item"><div class="k">Marcadas p/ incluir</div><div class="v">${nIncluir}</div></div>
     <div class="item"><div class="k">OK</div><div class="v">${nOk}</div></div>
     <div class="item"><div class="k">Conferir</div><div class="v">${nWarn}</div></div>
     <div class="item"><div class="k">Pendente</div><div class="v">${nErr}</div></div>
     <div class="item"><div class="k">Extrato sem título</div><div class="v">${semExtrato.length}</div></div>
   </div>
-  <div class="help">Revise as linhas marcadas antes de baixar — campos são editáveis. Vermelho = falta CNPJ ou não achou o título no extrato; amarelo = casou mas com intervalo grande entre vencimento e crédito (conferir).</div>
+  <div class="help">Revise as linhas marcadas antes de baixar — campos são editáveis. Vermelho = falta CNPJ ou não achou o título no extrato; amarelo = casou mas com intervalo grande entre vencimento e crédito (conferir). A coluna <b>Incluir</b> decide o que entra no arquivo baixado — títulos sem correspondência no extrato começam <b>desmarcados</b> (ainda não têm uma baixa de verdade pra reportar); marque de novo se preencher a data/valor manualmente.</div>
+  <div class="btn-row">
+    <button class="btn ghost small" onclick="marcarTodos(true)">Marcar todos</button>
+    <button class="btn ghost small" onclick="marcarTodos(false)">Desmarcar todos</button>
+  </div>
   <div class="table-wrap"><table class="preview"><thead><tr>
-    <th>Nº Nota</th><th>CNPJ/CPF</th><th>Nome</th><th>Vencimento</th><th>Data Baixa</th><th>${modelo.valorLabel}</th><th>Juros</th><th>Multa</th><th>Desconto</th>
+    <th>Incluir</th><th>Nº Nota</th><th>CNPJ/CPF</th><th>Nome</th><th>Vencimento</th><th>Data Baixa</th><th>${modelo.valorLabel}</th><th>Juros</th><th>Multa</th><th>Desconto</th>
     ${modelo.cols===12 ? "<th>PIS</th><th>COFINS</th><th>CSLL</th><th>IRRF</th>" : ""}
-    <th>Status</th>
+    <th>Status</th><th></th>
   </tr></thead><tbody>`;
   rows.forEach((r,i)=>{
     const trCls = r.statusClass || "";
     html += `<tr class="${trCls}">
+      <td class="cell" style="text-align:center"><input type="checkbox" ${r.incluir?"checked":""} onchange="updateRow(${i},'incluir',this.checked)"></td>
       <td class="cell"><input class="cell-input" value="${r.numero}" onchange="updateRow(${i},'numero',this.value)"></td>
       <td class="cell"><input class="cell-input wide" value="${r.cnpj}" onchange="updateRow(${i},'cnpj',this.value)"></td>
       <td>${r.nome||""}</td>
@@ -739,12 +753,13 @@ function renderResult(rows, semExtrato, empresaNome, empresaCnpj){
       <td class="cell"><input class="cell-input num" value="${fmtBRL(r.csll)}" onchange="updateRow(${i},'csll',this.value)"></td>
       <td class="cell"><input class="cell-input num" value="${fmtBRL(r.irrf)}" onchange="updateRow(${i},'irrf',this.value)"></td>` : ""}
       <td>${r.statusText}</td>
+      <td><button class="btn small ghost" onclick="removeRow(${i})">✕</button></td>
     </tr>`;
   });
   html += `</tbody></table></div>
   <div class="btn-row">
-    <button class="btn" onclick="downloadResultXlsx()">Baixar ${modelo.xlsxName}</button>
-    <button class="btn ghost" onclick="downloadResultTxt()">Baixar ${modelo.txtName}</button>
+    <button class="btn" onclick="downloadResultXlsx()">Baixar ${modelo.xlsxName} (${nIncluir} marcada(s))</button>
+    <button class="btn ghost" onclick="downloadResultTxt()">Baixar ${modelo.txtName} (${nIncluir} marcada(s))</button>
   </div>`;
   box.innerHTML = html;
 
@@ -759,6 +774,7 @@ function renderClientesCount(){
 }
 function updateRow(i, field, val){
   const r = rowsState[i];
+  if(field==="incluir"){ r.incluir = !!val; rerenderResult(); return; }
   if(field==="vencimento" || field==="databaixa"){ const dt=brDateToParts(val); r[field] = dt || null; }
   else if(["valor","juros","multa","desconto","pis","cofins","csll","irrf"].includes(field)){ const n=parseBRL(val); if(n!=null) r[field]=n; }
   else { r[field]=val; }
@@ -768,24 +784,44 @@ function updateRow(i, field, val){
     r.statusText = cl.valido ? (r.statusText.includes("larga")?r.statusText:"OK") : "CNPJ/CPF inválido";
   }
 }
+function marcarTodos(incluir){
+  rowsState.forEach(r=> r.incluir = incluir);
+  rerenderResult();
+}
+function removeRow(i){
+  rowsState.splice(i,1);
+  rerenderResult();
+}
+function rerenderResult(){
+  if(!lastResultCtx) return;
+  renderResult(rowsState, lastResultCtx.semExtrato, lastResultCtx.empresaNome, lastResultCtx.empresaCnpj);
+}
 function rowArray(r, modelo){
   const base = [r.numero, onlyDigits(r.cnpj), fmtDateBR(r.vencimento), fmtDateBR(r.databaixa), r.valor, r.juros, r.multa, r.desconto];
   return modelo.cols===12 ? [...base, r.pis, r.cofins, r.csll, r.irrf] : base;
 }
 function downloadResultXlsx(){
   const modelo = MODELOS[currentModelo];
+  const incluidas = rowsState.filter(r=>r.incluir);
+  if(!incluidas.length){ alert("Nenhuma linha marcada pra incluir."); return; }
   const header8 = ["Número da Nota", modelo.cnpjLabel, "Data de Vencimento da Parcela", "Data da Baixa da Parcela", modelo.valorLabel, "Valor Juros", "Valor Multa", "Valor Desconto"];
   const header = modelo.cols===12 ? [...header8, "Valor PIS","Valor COFINS","Valor CSLL","Valor IRRF"] : header8;
-  const aoa = [header, ...rowsState.map(r=>rowArray(r, modelo))];
+  const aoa = [header, ...incluidas.map(r=>rowArray(r, modelo))];
   downloadXlsx(modelo.xlsxName, aoa, "Baixa");
 }
 function downloadResultTxt(){
   const modelo = MODELOS[currentModelo];
-  const naoValidas = rowsState.filter(r=>{ const c=classifyDocumento(r.cnpj); return !c.valido; });
+  const incluidas = rowsState.filter(r=>r.incluir);
+  if(!incluidas.length){ alert("Nenhuma linha marcada pra incluir."); return; }
+  const naoValidas = incluidas.filter(r=>{ const c=classifyDocumento(r.cnpj); return !c.valido; });
   if(naoValidas.length){
-    if(!confirm(`${naoValidas.length} linha(s) ainda têm CNPJ/CPF ausente ou inválido. Gerar mesmo assim (essas linhas provavelmente serão rejeitadas pelo Domínio)?`)) return;
+    if(!confirm(`${naoValidas.length} linha(s) marcada(s) ainda têm CNPJ/CPF ausente ou inválido. Gerar mesmo assim (essas linhas provavelmente serão rejeitadas pelo Domínio)?`)) return;
   }
-  const lines = rowsState.map(r=>{
+  const semData = incluidas.filter(r=>!r.databaixa);
+  if(semData.length){
+    if(!confirm(`${semData.length} linha(s) marcada(s) ainda estão sem Data da Baixa preenchida. Gerar mesmo assim?`)) return;
+  }
+  const lines = incluidas.map(r=>{
     const arr = rowArray(r, modelo);
     return arr.map((v,i)=> i>=4 ? fmtValorTxt(v) : v).join(";");
   });
