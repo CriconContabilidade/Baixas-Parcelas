@@ -154,12 +154,13 @@ code{background:var(--paper);padding:1px 5px;border-radius:3px;font-family:'IBM 
   <!-- ===================== RESULTADO ===================== -->
   <div class="card hidden" id="resultCard"></div>
 
-  <!-- ===================== CADASTRO CNPJ (fallback) ===================== -->
-  <div class="card hidden" id="cnpjHelperCard">
-    <div class="section-title">CNPJs não encontrados — importar cadastro</div>
-    <div class="help">Sobraram títulos sem CNPJ resolvido. Solte aqui o relatório de <b>Clientes</b> ou <b>Fornecedores</b> (PDF do Domínio) <b id="cnpjHelperEmpresa"></b> — já sei o CNPJ da empresa pelo relatório de Contas a Pagar/Receber, então não precisa digitar nada. Isso atualiza o cadastro compartilhado do escritório e já resolve as linhas pendentes na hora.</div>
+  <!-- ===================== CADASTRO CLIENTES/FORNECEDORES (CNPJ) ===================== -->
+  <div class="card" id="cnpjHelperCard">
+    <div class="section-title">Cadastro de Clientes/Fornecedores (CNPJ)</div>
+    <div class="help">Solte aqui o relatório de <b>Clientes</b> ou <b>Fornecedores</b> (PDF do Domínio) de qualquer empresa <b id="cnpjHelperEmpresa"></b> pra alimentar o cadastro de CNPJ compartilhado com a Conversões Cibele e as outras ferramentas do escritório. Se você já processou uma baixa acima e sobraram títulos sem CNPJ, importe aqui o relatório certo — já sei o CNPJ da empresa pelo relatório de Contas a Pagar/Receber, então não precisa digitar nada, e as linhas pendentes já são resolvidas na hora.</div>
     <div class="dropzone" id="cadPdfDrop" style="padding:16px;"><div class="big">Arraste o PDF de Clientes/Fornecedores aqui</div><input type="file" id="cadPdfFile" accept="application/pdf"></div>
     <div id="cadPdfStatus" class="status-line hidden"></div>
+    <div class="summary-row"><div class="item"><div class="k">Cadastrados (CNPJ/CPF)</div><div class="v" id="clientesCount">0</div></div></div>
   </div>
 
   <!-- ===================== CADASTRO DE EMPRESAS (código Domínio × CNPJ) ===================== -->
@@ -671,9 +672,14 @@ function renderResult(rows, semExtrato, empresaNome, empresaCnpj){
   </div>`;
   box.innerHTML = html;
 
-  document.getElementById("cnpjHelperCard").classList.toggle("hidden", nErr===0 || rows.every(r=>r.cnpj));
   document.getElementById("cnpjHelperEmpresa").textContent = `da empresa ${empresaNome} (CNPJ ${empresaCnpj})`;
   cnpjHelperEmpresaCnpj = empresaCnpj;
+  if(nErr>0 && !rows.every(r=>r.cnpj)){
+    document.getElementById("cnpjHelperCard").scrollIntoView({behavior:"smooth", block:"nearest"});
+  }
+}
+function renderClientesCount(){
+  document.getElementById("clientesCount").textContent = Object.keys(clientesDB).length;
 }
 function updateRow(i, field, val){
   const r = rowsState[i];
@@ -801,6 +807,7 @@ wireDropzone("cadPdfDrop","cadPdfFile", async (f,d)=>{
     });
     saveClientes(clientesDB);
     rebuildCodigoIndex();
+    renderClientesCount();
     if(window.baixasCloud) window.baixasCloud.pushManyClientes(dirty);
     status.classList.add("ok");
     status.textContent = `Cadastro atualizado: ${addedCli} cliente(s)/fornecedor(es) novo(s), ${updatedCod} código(s) vinculado(s). Reprocessando...`;
@@ -872,6 +879,18 @@ wireDropzone("empresasPdfDrop","empresasPdfFile", async (f,d)=>{
 function loadClientes(){ const raw = localStorage.getItem("cibele_clientes_fornecedores"); return raw ? JSON.parse(raw) : {}; }
 function saveClientes(db){ localStorage.setItem("cibele_clientes_fornecedores", JSON.stringify(db)); }
 let clientesDB = loadClientes();
+// O script do Firestore roda num <script type="module"> à parte, que tem
+// escopo próprio e não enxerga variáveis "let" deste script por nome — só
+// consegue mexer em propriedades de "window". Por isso expomos um setter
+// (mesmo padrão já usado na Conversões Cibele) em vez de deixar o módulo
+// reatribuir "window.clientesDB" direto, o que deixaria essa variável
+// "clientesDB" (a que resolverCnpj/rebuildCodigoIndex realmente usam)
+// permanentemente desatualizada.
+function setClientesDB(db){
+  clientesDB = db; window.clientesDB = db;
+  saveClientes(db); rebuildCodigoIndex(); renderClientesCount();
+}
+window.clientesDB = clientesDB;
 
 // Cadastro de Empresas (código Domínio × CNPJ) — collection própria
 // ("empresas_cricon"), separada de "clientes" pra não misturar semânticas
@@ -879,9 +898,15 @@ let clientesDB = loadClientes();
 function loadEmpresas(){ const raw = localStorage.getItem("baixas_empresas_cricon"); return raw ? JSON.parse(raw) : {}; }
 function saveEmpresas(db){ localStorage.setItem("baixas_empresas_cricon", JSON.stringify(db)); }
 let empresasDB = loadEmpresas();
+function setEmpresasDB(db){
+  empresasDB = db; window.empresasDB = db;
+  saveEmpresas(db); renderEmpresasCount();
+}
+window.empresasDB = empresasDB;
 
 rebuildCodigoIndex();
 renderEmpresasCount();
+renderClientesCount();
 selectModelo("entradas");
 </script>
 
@@ -933,14 +958,11 @@ onAuthStateChanged(auth, (user)=>{
       firstClientesSnap = false;
       const localOnly = {};
       Object.keys(window.clientesDB||{}).forEach(k=>{ if(!cloudData[k]) localOnly[k]=window.clientesDB[k]; });
-      window.clientesDB = {...cloudData, ...localOnly};
-      saveClientes(window.clientesDB);
+      window.setClientesDB({...cloudData, ...localOnly});
       if(Object.keys(localOnly).length) window.baixasCloud.pushManyClientes(localOnly);
     } else {
-      window.clientesDB = cloudData;
-      saveClientes(window.clientesDB);
+      window.setClientesDB(cloudData);
     }
-    if(window.rebuildCodigoIndex) window.rebuildCodigoIndex();
     setCloudBadge("Sincronizado com a nuvem", "ok");
   }, err=>{ console.error("clientes onSnapshot", err); setCloudBadge("Erro de sincronização", "err"); });
 
@@ -951,14 +973,11 @@ onAuthStateChanged(auth, (user)=>{
       firstEmpresasSnap = false;
       const localOnly = {};
       Object.keys(window.empresasDB||{}).forEach(k=>{ if(!cloudData[k]) localOnly[k]=window.empresasDB[k]; });
-      window.empresasDB = {...cloudData, ...localOnly};
-      saveEmpresas(window.empresasDB);
+      window.setEmpresasDB({...cloudData, ...localOnly});
       if(Object.keys(localOnly).length) window.baixasCloud.pushManyEmpresas(localOnly);
     } else {
-      window.empresasDB = cloudData;
-      saveEmpresas(window.empresasDB);
+      window.setEmpresasDB(cloudData);
     }
-    if(window.renderEmpresasCount) window.renderEmpresasCount();
   }, err=>{
     // Collection nova — se as regras do Firestore ainda não liberarem ela,
     // isso falha aqui mas o resto da ferramenta continua funcionando
