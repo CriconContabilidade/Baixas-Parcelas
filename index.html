@@ -384,8 +384,12 @@ async function parseContasReport(file, tipoReport){
       titulos.push({
         codigo, nome: nomeParceiro,
         documento: tm[1],
-        vencimento: brDateToParts(tm[2]),
-        dataRef: brDateToParts(tm[3]),
+        // tm[2] é Emissão e tm[3] é Vencimento na ordem das colunas do relatório
+        // (Documento/Emissão/Saída/Vencimento) — usar o índice errado aqui fazia o
+        // casamento por janela de dias comparar contra a data de emissão, não a de
+        // vencimento, e gravava a data errada na coluna "Vencimento" do TXT exportado.
+        emissao: brDateToParts(tm[2]),
+        vencimento: brDateToParts(tm[3]),
         valorParcela: parseBRL(tm[4]),
         valorBaixado: parseBRL(tm[5]),
         situacao: tm[6],
