@@ -144,7 +144,7 @@ code{background:var(--paper);padding:1px 5px;border-radius:3px;font-family:'IBM 
       </div>
       <div class="field">
         <label>Extrato bancário / recebidos (.xlsx, .ofx ou PDF)</label>
-        <div class="dropzone" id="extratoDrop"><div class="big">Arraste o extrato aqui</div><div class="small">Excel com coluna "Data" + valor, .ofx, ou PDF de extrato do Banco do Brasil</div><input type="file" id="extratoFile" accept=".xlsx,.xls,.ofx,application/pdf"></div>
+        <div class="dropzone" id="extratoDrop"><div class="big">Arraste o extrato aqui</div><div class="small">Excel com coluna "Data" + valor, .ofx, ou PDF (Banco do Brasil, Sicoob, Unicred, Banco Inter, CaixaW ProSind)</div><input type="file" id="extratoFile" accept=".xlsx,.xls,.ofx,application/pdf"></div>
       </div>
     </div>
     <div class="btn-row"><button class="btn" id="processBtn" disabled onclick="processarBaixa()">Processar</button></div>
@@ -498,30 +498,275 @@ async function readExtratoXlsx(file){
 }
 
 /* =========================================================================
-   EXTRATO PDF — "Extrato de conta corrente" do Banco do Brasil (autoatendimento).
-   Cada lançamento tem C (crédito, dinheiro entra) ou D (débito, dinheiro
-   sai) no fim da linha; opcionalmente um saldo depois. Guardamos o tipo
-   pra filtrar depois: Entradas usa débitos (pagamento a fornecedor), Saídas
-   e Serviços usam créditos (recebimento de cliente) — o motor de casamento
-   por soma exata cuida de descartar o que não corresponder a nenhum título,
-   então não precisamos adivinhar quais créditos/débitos são "de verdade".
+   EXTRATO PDF — vários bancos. Reaproveita literalmente a extração de PDF
+   e os parsers já testados na ferramenta "Conversor de Extrato" do Hub
+   (mesmo GitHub, repo Extrato-OFX) — copiados aqui porque cada ferramenta
+   do Hub é um HTML autocontido, sem import entre elas. Se um parser for
+   corrigido/melhorado lá, replique aqui também (e vice-versa).
+
+   Cada parser: {id, bank, detect(text)->bool, parse(text) ou
+   parseFile(file)->resultado}. O resultado de cada um tem um formato
+   ligeiramente diferente (checking vs relatório de caixa); a função
+   `transacoesDoResultado` abaixo normaliza tudo pra {data:{y,m,d}, valor,
+   tipo:'C'|'D'} — mesmo formato que já usamos pro extrato Banco do Brasil
+   e pro OFX, consumido pelo motor de casamento.
    ========================================================================= */
-const EXTRATO_BB_LINE_RE = /^(\d{2}\/\d{2}\/\d{4})\s+\S+\s+\S+\s+\S+\s+(.+?)\s+(\S+)\s+([\d.,]+)\s+([CD])(?:\s+[\d.,]+\s+[CD])?$/;
-async function readExtratoPdfBB(file){
-  const pages = await extractPdfAllLines(file);
-  const allLines = pages.flat();
-  const out = [];
-  allLines.forEach(line=>{
-    if(!/^\d{2}\/\d{2}\/\d{4}/.test(line)) return;
-    if(/Saldo Anterior/i.test(line)) return;
-    const m = line.match(EXTRATO_BB_LINE_RE);
-    if(!m) return;
-    const dt = brDateToParts(m[1]);
-    const valor = parseBRL(m[4]);
-    if(!dt || valor==null) return;
-    out.push({data:dt, valor:Math.abs(valor), tipo:m[5]});
+async function extractPdfPagesBanco(file) {
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  const pages = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const viewport = page.getViewport({ scale: 1 });
+    const content = await page.getTextContent();
+    const items = content.items
+      .filter(it => it.str !== undefined)
+      .map(it => {
+        const tx = pdfjsLib.Util.transform(viewport.transform, it.transform);
+        const w = it.width || (it.str.length * Math.abs(it.transform[0] || 5));
+        return { str: it.str, x: tx[4], y: tx[5], x2: tx[4] + w };
+      });
+    const Y_CHAIN_TOL = 6.5;
+    const sorted = items.slice().sort((a, b) => (a.y - b.y) || (a.x - b.x));
+    const rows = [];
+    for (const it of sorted) {
+      const last = rows[rows.length - 1];
+      if (last && Math.abs(last.y - it.y) < Y_CHAIN_TOL) { last.items.push(it); last.y = it.y; }
+      else rows.push({ y: it.y, items: [it] });
+    }
+    for (const row of rows) row.items.sort((a, b) => a.x - b.x);
+    pages.push({ rows, height: viewport.height });
+  }
+  return pages;
+}
+async function extractPositionedRowsBanco(file) {
+  const pages = await extractPdfPagesBanco(file);
+  return pages.map(p => ({ height: p.height, rows: p.rows.map(row => row.items.filter(it => it.str.trim() !== '')) }));
+}
+async function extractTextBanco(file) {
+  const pages = await extractPdfPagesBanco(file);
+  const pageTexts = pages.map(p => p.rows).map(rows => {
+    const lines = rows.map(row => {
+      let line = '', prevEnd = null;
+      for (const it of row.items) {
+        const str = it.str;
+        if (str.trim() === '') continue;
+        if (prevEnd !== null) {
+          const gap = it.x - prevEnd;
+          if (gap > 0.6 || !/\s$/.test(line)) { if (gap > 0.6 || line.length) line += ' '; }
+        }
+        line += str;
+        prevEnd = it.x2;
+      }
+      return line.replace(/\s+/g, ' ').trim();
+    }).filter(l => l.length > 0);
+    return lines.join('\n');
   });
-  return out;
+  return pageTexts.join('\n');
+}
+function parseBRLBanco(str) {
+  const cleaned = String(str).replace(/[^0-9,.\-]/g, '');
+  return parseFloat(cleaned.replace(/\./g, '').replace(',', '.'));
+}
+function brToDateBanco(str) { const [d, m, y] = str.split('/').map(Number); return new Date(Date.UTC(y, m - 1, d)); }
+function dateToParts(d) { return { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, d: d.getUTCDate() }; }
+function fmtOfxDateBanco(d) { return d.toISOString().slice(0, 10).replace(/-/g, ''); }
+const MESES_PT_LONG_BANCO = { janeiro:1, fevereiro:2, marco:3, abril:4, maio:5, junho:6, julho:7, agosto:8, setembro:9, outubro:10, novembro:11, dezembro:12 };
+function stripAccentsBanco(s) { return s.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+
+const PARSERS_BANCO = [];
+
+// ---- Banco do Brasil · Extrato de conta corrente (autoatendimento) ----
+PARSERS_BANCO.push({
+  id: 'bb-checking', bank: 'Banco do Brasil',
+  detect(text) { return /Banco do Brasil/i.test(text) && /Extrato de conta corrente/i.test(text); },
+  parse(rawText) {
+    const lines = rawText.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+    const RE = /^(\d{2}\/\d{2}\/\d{4})\s+\S+\s+\S+\s+\S+\s+(.+?)\s+(\S+)\s+([\d.,]+)\s+([CD])(?:\s+[\d.,]+\s+[CD])?$/;
+    const transactions = [];
+    lines.forEach(line=>{
+      if(!/^\d{2}\/\d{2}\/\d{4}/.test(line) || /Saldo Anterior/i.test(line)) return;
+      const m = line.match(RE);
+      if(!m) return;
+      transactions.push({ date: brToDateBanco(m[1]), amount: m[5]==='D' ? -parseBRLBanco(m[4]) : parseBRLBanco(m[4]) });
+    });
+    if(!transactions.length) throw new Error('Nenhum lançamento reconhecido no extrato do Banco do Brasil.');
+    return { transactions };
+  }
+});
+
+// ---- Sicoob · Extrato Conta Corrente -----------------------------------
+PARSERS_BANCO.push({
+  id: 'sicoob-checking', bank: 'Sicoob',
+  detect(text) { return /SICOOB/.test(text) && /EXTRATO CONTA CORRENTE/.test(text); },
+  parse(rawText) {
+    const lines = rawText.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+    const periodMatch = rawText.match(/PER[ÍI]ODO:\s*(\d{2}\/\d{2}\/\d{4})\s*-\s*(\d{2}\/\d{2}\/\d{4})/);
+    if (!periodMatch) throw new Error('Não foi possível identificar o período do extrato Sicoob.');
+    const periodEnd = brToDateBanco(periodMatch[2]);
+    const TXN_LINE = /^(\d{2}\/\d{2})\s+(.+?)\s+(-?[\d.]+,\d{2})\s*([CD])?\*?$/;
+    const ONLY_SUFFIX = /^([CD])\*?$/;
+    const startIdx = lines.findIndex(l => l === 'DATA HISTÓRICO VALOR' || l === 'HISTÓRICO DE MOVIMENTAÇÃO');
+    const endIdx = lines.findIndex(l => l === 'RESUMO');
+    const body = lines.slice(startIdx >= 0 ? startIdx + 1 : 0, endIdx >= 0 ? endIdx : lines.length);
+    const transactions = [];
+    let firstSaldoSeen = false;
+    for (let idx = 0; idx < body.length; idx++) {
+      const line = body[idx];
+      const m = line.match(TXN_LINE);
+      if (!m) continue;
+      let [, dateStr, desc, valueStr, suffix] = m;
+      if (!suffix) {
+        const next = body[idx + 1];
+        if (next && ONLY_SUFFIX.test(next)) { suffix = next.match(ONLY_SUFFIX)[1]; idx++; }
+      }
+      const [d, mth] = dateStr.split('/').map(Number);
+      let year = periodEnd.getUTCFullYear();
+      if (mth > periodEnd.getUTCMonth() + 1) year -= 1;
+      const date = new Date(Date.UTC(year, mth - 1, d));
+      const amountAbs = parseBRLBanco(valueStr);
+      const isSaldo = /^SALDO/.test(desc);
+      if (isSaldo) { firstSaldoSeen = true; continue; }
+      let j = idx + 1;
+      while (j < body.length) {
+        const l2 = body[j];
+        if (TXN_LINE.test(l2)) break;
+        if (ONLY_SUFFIX.test(l2)) { j++; continue; }
+        j++;
+      }
+      idx = j - 1;
+      transactions.push({ date, amount: suffix === 'D' ? -amountAbs : amountAbs });
+    }
+    if(!transactions.length) throw new Error('Nenhum lançamento reconhecido no extrato Sicoob.');
+    return { transactions };
+  }
+});
+
+// ---- Unicred · Extrato Conta Corrente ----------------------------------
+PARSERS_BANCO.push({
+  id: 'unicred-checking', bank: 'Unicred',
+  detect(text) {
+    return /Coop:\s*\d+\s*-\s*AG:\s*\d+\s*-\s*Conta:\s*[\d-]+/.test(text)
+      && /Data\s+Lan[çc]amentos\s+Valor\s*\(R\$\)\s+Saldo\s*\(R\$\)/i.test(text);
+  },
+  parse(rawText) {
+    const lines = rawText.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+    const TXN_LINE = /^(\d{2}\/\d{2}\/\d{4})\s+(.+?)\s+(-?\s?R\$\s?[\d.]+,\d{2})\s+(-?\s?R\$\s?[\d.]+,\d{2})$/;
+    const NOISE = /^(CENTRAL DE RELACIONAMENTO|0800|Saldo no final|Saldo atual|Total dispon[íi]vel|Saldo bloqueado|Limite de cheque especial|IOF\b|Juros|Tarifas pendentes|Saldo Bloqueado|Data\s+Lan[çc]amentos|Lan[çc]amentos futuros|P[áa]g\.)/i;
+    const transactions = [];
+    for (let idx = 0; idx < lines.length; idx++) {
+      const m = lines[idx].match(TXN_LINE);
+      if (!m) continue;
+      let [, dateStr, desc, valueStr] = m;
+      let openParens = (desc.match(/\(/g) || []).length, closeParens = (desc.match(/\)/g) || []).length;
+      let j = idx + 1;
+      while (openParens > closeParens && j < lines.length && !TXN_LINE.test(lines[j]) && !NOISE.test(lines[j])) {
+        openParens += (lines[j].match(/\(/g) || []).length; closeParens += (lines[j].match(/\)/g) || []).length; j++;
+      }
+      idx = j - 1;
+      transactions.push({ date: brToDateBanco(dateStr), amount: parseBRLBanco(valueStr) });
+    }
+    if (!transactions.length) throw new Error('Nenhum lançamento reconhecido no extrato Unicred.');
+    return { transactions };
+  }
+});
+
+// ---- Banco Inter · Extrato Conta Corrente ------------------------------
+PARSERS_BANCO.push({
+  id: 'inter-checking', bank: 'Banco Inter',
+  detect(text) { return /Institui[çc][ãa]o:\s*Banco Inter/i.test(text) && /Saldo do dia:/i.test(text); },
+  parse(rawText) {
+    const lines = rawText.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+    const periodMatch = rawText.match(/Per[íi]odo:\s*(\d{2})\/(\d{2})\/(\d{4})\s*a\s*(\d{2})\/(\d{2})\/(\d{4})/);
+    if (!periodMatch) throw new Error('Não foi possível identificar o período do extrato Inter.');
+    const periodStart = new Date(Date.UTC(+periodMatch[3], +periodMatch[2] - 1, +periodMatch[1]));
+    const DAY_HEADER = /^(\d{1,2}) de (\S+) de (\d{4}) Saldo do dia:\s*(-?R\$\s?[\d.]+,\d{2})/;
+    const TXN_LINE = /^(.+?):\s*"(.+?)"\s+(-?R\$\s?[\d.]+,\d{2})\s+(-?R\$\s?[\d.]+,\d{2})$/;
+    const transactions = [];
+    let currentDate = periodStart;
+    for (const line of lines) {
+      const dm = line.match(DAY_HEADER);
+      if (dm) {
+        const monthNum = MESES_PT_LONG_BANCO[stripAccentsBanco(dm[2].toLowerCase())];
+        if (monthNum) currentDate = new Date(Date.UTC(+dm[3], monthNum - 1, +dm[1]));
+        continue;
+      }
+      const tm = line.match(TXN_LINE);
+      if (!tm) continue;
+      transactions.push({ date: currentDate, amount: parseBRLBanco(tm[3]) });
+    }
+    if (transactions.length === 0) throw new Error('Nenhum lançamento reconhecido no extrato Inter.');
+    return { transactions };
+  }
+});
+
+// ---- CaixaW ProSind · Relatório do Caixa Detalhado ---------------------
+// Layout de colunas por posição x (não por espaço em branco) — usa
+// extractPositionedRowsBanco em vez de extractTextBanco. Ver a versão
+// completa/comentada no Conversor de Extrato (Extrato-OFX/index.html).
+PARSERS_BANCO.push({
+  id: 'caixa-prosind', bank: 'CaixaW ProSind',
+  detect(text) { return /CaixaW/i.test(text) && /Relat[óo]rio do Caixa Detalhado/i.test(text); },
+  async parseFile(file) {
+    const text = await extractTextBanco(file);
+    const mesMatch = text.match(/M[êe]s:\s*(\d{2})\/(\d{4})/);
+    if (!mesMatch) throw new Error('Não foi possível identificar o mês do relatório CaixaW.');
+    const mes = parseInt(mesMatch[1], 10), ano = parseInt(mesMatch[2], 10);
+    const pages = await extractPositionedRowsBanco(file);
+    const HEADER_Y_MAX = 155;
+    const FULL_LINE_SKIP = /^(CaixaW|Relat[óo]rio do Caixa|DIA\b.*DOCUMENTO|SALDO ANTERIOR|SALDO BLOQ|SALDO DO CAIXA|TOTAL:|NRO MOVIMENTOS)/i;
+    function band(tok) {
+      if (Math.abs(tok.x2 - 503.9) < 8) return 'entrada';
+      if (Math.abs(tok.x2 - 577.7) < 8) return 'saida';
+      if (tok.x < 40) return 'dia';
+      if (tok.x < 125) return 'doc';
+      if (tok.x < 155) return 'conta';
+      if (tok.x < 460) return 'desc';
+      return null;
+    }
+    const raw = [];
+    let current = null;
+    for (const page of pages) {
+      const footerYMin = page.height - 60;
+      for (const row of page.rows) {
+        if (row.length === 0) continue;
+        const y = row[0].y;
+        if (y < HEADER_Y_MAX || y > footerYMin) continue;
+        const fullLine = row.map(t => t.str).join(' ').trim();
+        if (!fullLine || FULL_LINE_SKIP.test(fullLine)) continue;
+        const cols = { dia: [], doc: [], entrada: [], saida: [] };
+        for (const tok of row) { const b = band(tok); if (b && cols[b]) cols[b].push(tok.str); }
+        const diaTxt = cols.dia.join(' ').trim();
+        const docTxt = cols.doc.join(' ').trim();
+        const entradaTxt = cols.entrada.join(' ').trim();
+        const saidaTxt = cols.saida.join(' ').trim();
+        const isTxnStart = /^\d{1,2}$/.test(diaTxt) && docTxt.length > 0;
+        if (isTxnStart) { if (current) raw.push(current); current = { dia: diaTxt, entrada: entradaTxt, saida: saidaTxt }; }
+        else if (current) {
+          if (entradaTxt && !current.entrada) current.entrada = entradaTxt;
+          if (saidaTxt && !current.saida) current.saida = saidaTxt;
+        }
+      }
+    }
+    if (current) raw.push(current);
+    if (raw.length === 0) throw new Error('Nenhum lançamento reconhecido no relatório CaixaW.');
+    const transactions = raw.map(t => {
+      const entrada = t.entrada ? parseBRLBanco(t.entrada) : 0;
+      const saida = t.saida ? parseBRLBanco(t.saida) : 0;
+      return { date: new Date(Date.UTC(ano, mes - 1, parseInt(t.dia, 10))), amount: entrada > 0 ? entrada : -saida };
+    });
+    return { transactions };
+  }
+});
+
+async function readExtratoPdfMultiBanco(file){
+  const text = await extractTextBanco(file);
+  const parser = PARSERS_BANCO.find(p => p.detect(text));
+  if(!parser){
+    throw new Error('Não reconheci o banco desse PDF. Bancos suportados hoje: ' + PARSERS_BANCO.map(p=>p.bank).join(', ') + '. Se for um extrato novo, me manda um exemplo que eu adiciono o parser.');
+  }
+  const result = parser.parseFile ? await parser.parseFile(file) : parser.parse(text);
+  return result.transactions.map(t => ({ data: dateToParts(t.date), valor: Math.abs(t.amount), tipo: t.amount < 0 ? 'D' : 'C' }));
 }
 /* =========================================================================
    EXTRATO OFX — formato padrão (o mesmo que a ferramenta "Conversor de
@@ -555,7 +800,7 @@ async function readExtratoOfx(file){
 }
 async function readExtrato(file){
   const name = file.name||"";
-  if(file.type==="application/pdf" || /\.pdf$/i.test(name)) return readExtratoPdfBB(file);
+  if(file.type==="application/pdf" || /\.pdf$/i.test(name)) return readExtratoPdfMultiBanco(file);
   if(/\.ofx$/i.test(name)) return readExtratoOfx(file);
   return readExtratoXlsx(file);
 }
