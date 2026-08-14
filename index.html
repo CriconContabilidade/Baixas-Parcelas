@@ -359,7 +359,7 @@ function markDropDone(drop, label){
 const EMPRESA_RE = /^Empresa:\s*(.+?)\s+P.gina/i;
 const CNPJ_HEADER_RE = /CNPJ:\s*([\d.\/-]{14,18})/;
 const GROUP_RE = /^(Cliente|Fornecedor):\s*(\d+)\s*-\s*(.+)$/;
-const TITULO_RE = /^(\S+)\s+(\d{2}\/\d{2}\/\d{4})\s+\d{2}\/\d{2}\/\d{4}\s+(\d{2}\/\d{2}\/\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+[\d.,]+\s+[\d.,]+\s+[\d.,]+\s+[\d.,]+\s+[\d.,]+\s+[\d.,]+\s*(Aberta|Parcial|Baixada|Recebida|Paga)$/;
+const TITULO_RE = /^(\S+)\s+(\d{2}\/\d{2}\/\d{4})\s+\d{2}\/\d{2}\/\d{4}\s+(\d{2}\/\d{2}\/\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+[\d.,]+\s+[\d.,]+\s+[\d.,]+\s+[\d.,]+\s+[\d.,]+\s+([\d.,]+)\s*(Aberta|Parcial|Baixada|Recebida|Paga)$/;
 
 async function parseContasReport(file, tipoReport){
   const pages = await extractPdfAllLines(file);
@@ -392,7 +392,8 @@ async function parseContasReport(file, tipoReport){
         vencimento: brDateToParts(tm[3]),
         valorParcela: parseBRL(tm[4]),
         valorBaixado: parseBRL(tm[5]),
-        situacao: tm[6],
+        saldo: parseBRL(tm[6]),
+        situacao: tm[7],
       });
     } else if(/^\S+\s+\d{2}\/\d{2}\/\d{4}/.test(line)){
       naoLidas.push(line);
@@ -432,7 +433,7 @@ function dpSubsetExact(pool, targetCents){
 }
 
 function matchAll(lumps, abertos){
-  abertos.forEach(a=>{ a._cents = Math.round(a.valorParcela*100); a._used = false; });
+  abertos.forEach(a=>{ a._cents = Math.round(a.valorEfetivo*100); a._used = false; });
   const results = {}; // idx do lump -> lista de titulos
   const wideResolved = new Set();
   let remaining = lumps.map((_,i)=>i);
@@ -619,7 +620,11 @@ function checkReady(){
 let rowsState = [];
 function processarBaixa(){
   const modelo = MODELOS[currentModelo];
-  const abertos = contasState.titulos.filter(t=> normalizeText(t.situacao).startsWith("ABERT"));
+  const abertos = contasState.titulos
+    .filter(t=> { const s=normalizeText(t.situacao); return s.startsWith("ABERT") || s.startsWith("PARCIAL"); })
+    // títulos "Parcial" já receberam parte do valor; o que resta em aberto
+    // pra casar contra o extrato e dar baixa é o Saldo, não a parcela cheia.
+    .map(t=> ({...t, valorEfetivo: normalizeText(t.situacao).startsWith("PARCIAL") ? t.saldo : t.valorParcela}));
   const lumps = extratoState;
   const {results, wideResolved, unmatchedLumpIdx, unmatchedAbertos} = matchAll(lumps, abertos.map(a=>({...a})));
 
@@ -649,7 +654,7 @@ function buildRow(titulo, dataBaixa, statusClass, statusText){
     nome: cnpjInfo ? cnpjInfo.nome : titulo.nome,
     vencimento: titulo.vencimento,
     databaixa: dataBaixa,
-    valor: titulo.valorParcela,
+    valor: titulo.valorEfetivo ?? titulo.valorParcela,
     juros:0, multa:0, desconto:0, pis:0, cofins:0, csll:0, irrf:0,
     statusClass: cls, statusText: txt,
     codigo: titulo.codigo,
