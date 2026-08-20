@@ -144,7 +144,7 @@ code{background:var(--paper);padding:1px 5px;border-radius:3px;font-family:'IBM 
       </div>
       <div class="field">
         <label>Extrato bancário / recebidos (.xlsx, .ofx ou PDF)</label>
-        <div class="dropzone" id="extratoDrop"><div class="big">Arraste o extrato aqui</div><div class="small">Excel com coluna "Data" + valor, .ofx, ou PDF (Banco do Brasil, Sicoob, Unicred, Banco Inter, CaixaW ProSind)</div><input type="file" id="extratoFile" accept=".xlsx,.xls,.ofx,application/pdf"></div>
+        <div class="dropzone" id="extratoDrop"><div class="big">Arraste o(s) extrato(s) aqui</div><div class="small">Excel com coluna "Data" + valor, .ofx, ou PDF (Banco do Brasil, Sicoob, Unicred, Banco Inter, CaixaW ProSind, Credcrea) — pode soltar vários meses de uma vez</div><input type="file" id="extratoFile" accept=".xlsx,.xls,.ofx,application/pdf" multiple></div>
       </div>
     </div>
     <div class="btn-row"><button class="btn" id="processBtn" disabled onclick="processarBaixa()">Processar</button></div>
@@ -348,6 +348,18 @@ function wireDropzone(dropId, inputId, onFile){
     if(e.dataTransfer.files[0]) onFile(e.dataTransfer.files[0], drop);
   });
 }
+function wireDropzoneMulti(dropId, inputId, onFiles){
+  const drop = document.getElementById(dropId);
+  const input = document.getElementById(inputId);
+  drop.addEventListener("click", ()=>input.click());
+  input.addEventListener("change", ()=>{ if(input.files.length) onFiles([...input.files], drop); });
+  drop.addEventListener("dragover", e=>{ e.preventDefault(); drop.classList.add("drag"); });
+  drop.addEventListener("dragleave", ()=> drop.classList.remove("drag"));
+  drop.addEventListener("drop", e=>{
+    e.preventDefault(); drop.classList.remove("drag");
+    if(e.dataTransfer.files.length) onFiles([...e.dataTransfer.files], drop);
+  });
+}
 function markDropDone(drop, label){
   drop.classList.add("done");
   drop.querySelector(".big").textContent = "✓ " + label;
@@ -408,6 +420,10 @@ async function parseContasReport(file, tipoReport){
    progressivas, processa primeiro os casos mais restritos)
    ========================================================================= */
 const WINDOWS = [[0,6],[-3,12],[-8,20],[-12,30]];
+// "Entradas" (baixa de fornecedor via cheque nominal) costuma atrasar bem mais do que
+// recebimentos de cliente — o caixa aperta e o pagamento sai meses depois do vencimento.
+// Janela mais larga, mas sempre marcando fora da 1ª faixa como "conferir".
+const WINDOWS_ENTRADAS = [[0,10],[-5,30],[-15,90],[-30,240]];
 
 function dpSubsetExact(pool, targetCents){
   const n = pool.length;
@@ -460,6 +476,52 @@ function matchAll(lumps, abertos){
   }
   const unmatchedAbertos = abertos.filter(a=>!a._used);
   return {results, wideResolved, unmatchedLumpIdx:remaining, unmatchedAbertos};
+}
+
+// Variante pra "entradas": um cheque paga UM fornecedor por vez (nunca mistura títulos de
+// fornecedores diferentes num mesmo pagamento) — diferente de recebimentos de cliente, onde
+// um lote do extrato pode legitimamente somar boletos de vários clientes num só depósito.
+// Por isso a busca de subconjunto roda separada, por fornecedor (campo "codigo"). Se MAIS DE
+// UM fornecedor consegue formar um subconjunto que bate exatamente com o mesmo valor do
+// extrato dentro da janela, o casamento fica ambíguo de propósito — nunca escolhe um "no
+// chute" (mesmo risco que soma sem âncora de identidade, documentado na skill de baixas).
+function matchAllScoped(lumps, abertos, windows){
+  abertos.forEach(a=>{ a._cents = Math.round(a.valorEfetivo*100); a._used = false; });
+  const porCodigo = {};
+  abertos.forEach(a=>{ (porCodigo[a.codigo] = porCodigo[a.codigo]||[]).push(a); });
+  const codigos = Object.keys(porCodigo);
+  const results = {};
+  const wideResolved = new Set();
+  const ambiguous = {}; // idx do lump -> lista de {codigo, nome} candidatos (>1 fornecedor bate)
+  let remaining = lumps.map((_,i)=>i);
+
+  for(let passNo=0; passNo<windows.length; passNo++){
+    const [wlo, whi] = windows[passNo];
+    const still = [];
+    remaining.forEach(idx=>{
+      const targetCents = Math.round(lumps[idx].valor*100);
+      const candidatos = [];
+      codigos.forEach(cod=>{
+        const pool = porCodigo[cod].filter(a=> !a._used && diffDays(lumps[idx].data, a.vencimento)>=wlo && diffDays(lumps[idx].data, a.vencimento)<=whi);
+        if(!pool.length) return;
+        const found = dpSubsetExact(pool, targetCents);
+        if(found) candidatos.push({codigo:cod, found});
+      });
+      if(candidatos.length===1){
+        candidatos[0].found.forEach(a=>a._used=true);
+        results[idx] = candidatos[0].found;
+        if(passNo>0) wideResolved.add(idx);
+      } else if(candidatos.length>1){
+        ambiguous[idx] = candidatos.map(c=>({codigo:c.codigo, nome:c.found[0].nome}));
+        still.push(idx);
+      } else {
+        still.push(idx);
+      }
+    });
+    remaining = still;
+  }
+  const unmatchedAbertos = abertos.filter(a=>!a._used);
+  return {results, wideResolved, unmatchedLumpIdx:remaining, unmatchedAbertos, ambiguous};
 }
 
 /* =========================================================================
@@ -759,6 +821,36 @@ PARSERS_BANCO.push({
   }
 });
 
+// ---- Credcrea (cooperativa) · Extrato conta corrente -------------------
+// Uma linha de texto por lançamento ("DD/MM/AAAA HISTÓRICO... VALOR SALDO"),
+// sem marcação C/D explícita — o tipo é inferido comparando o saldo da linha
+// com o saldo da linha anterior (a 1ª linha, "SALDO ANTERIOR", só ancora o
+// saldo de partida, não é lançamento).
+PARSERS_BANCO.push({
+  id: 'credcrea-checking', bank: 'Credcrea',
+  detect(text) { return /Cooperativa:\s*Credcrea/i.test(text); },
+  parse(rawText) {
+    const lines = rawText.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+    const RE = /^(\d{2}\/\d{2}\/\d{4})\s+(.+?)\s+(-|[\d.]+,\d{2})\s+([\d.]+,\d{2})$/;
+    const transactions = [];
+    let saldoAnterior = null;
+    lines.forEach(line=>{
+      const m = line.match(RE);
+      if(!m) return;
+      const [,dateStr,desc,valorStr,saldoStr] = m;
+      const saldoAtual = parseBRLBanco(saldoStr);
+      const descTrim = desc.trim();
+      if(saldoAnterior===null || /^SALDO/i.test(descTrim)){ saldoAnterior = saldoAtual; return; }
+      const valor = parseBRLBanco(valorStr);
+      const amount = saldoAtual > saldoAnterior ? valor : -valor;
+      transactions.push({ date: brToDateBanco(dateStr), amount });
+      saldoAnterior = saldoAtual;
+    });
+    if(!transactions.length) throw new Error('Nenhum lançamento reconhecido no extrato Credcrea.');
+    return { transactions };
+  }
+});
+
 async function readExtratoPdfMultiBanco(file){
   const text = await extractTextBanco(file);
   const parser = PARSERS_BANCO.find(p => p.detect(text));
@@ -843,14 +935,16 @@ wireDropzone("contasDrop","contasFile", async (f,d)=>{
   }
   checkReady();
 });
-wireDropzone("extratoDrop","extratoFile", async (f,d)=>{
+wireDropzoneMulti("extratoDrop","extratoFile", async (files,d)=>{
   const status = document.getElementById("mainStatus");
-  status.classList.remove("hidden","err"); status.textContent = "Lendo extrato...";
+  status.classList.remove("hidden","err"); status.textContent = "Lendo extrato(s)...";
   try{
-    extratoRawState = await readExtrato(f);
-    if(!extratoRawState.length) throw new Error("Nenhum lançamento reconhecido nesse arquivo.");
+    const raw = [];
+    for(const f of files) raw.push(...await readExtrato(f));
+    extratoRawState = raw;
+    if(!extratoRawState.length) throw new Error("Nenhum lançamento reconhecido nesse(s) arquivo(s).");
     extratoState = filtrarExtratoPorModelo(extratoRawState);
-    markDropDone(d, `${f.name} (${extratoRawState.length} lançamentos)`);
+    markDropDone(d, `${files.length===1?files[0].name:files.length+" arquivo(s)"} (${extratoRawState.length} lançamentos)`);
     status.classList.add("hidden");
   }catch(err){
     status.classList.add("err"); status.textContent = "Erro: " + err.message;
@@ -871,7 +965,13 @@ function processarBaixa(){
     // pra casar contra o extrato e dar baixa é o Saldo, não a parcela cheia.
     .map(t=> ({...t, valorEfetivo: normalizeText(t.situacao).startsWith("PARCIAL") ? t.saldo : t.valorParcela}));
   const lumps = extratoState;
-  const {results, wideResolved, unmatchedLumpIdx, unmatchedAbertos} = matchAll(lumps, abertos.map(a=>({...a})));
+  // "Entradas" (fornecedor, cheque nominal) usa casamento escopado por fornecedor + janela
+  // mais larga; "saídas"/"serviços" (cliente, lote de boletos) usa o motor original, que
+  // pode legitimamente somar títulos de clientes diferentes num único depósito do dia.
+  const isEntradas = currentModelo === "entradas";
+  const {results, wideResolved, unmatchedLumpIdx, unmatchedAbertos, ambiguous} = isEntradas
+    ? matchAllScoped(lumps, abertos.map(a=>({...a})), WINDOWS_ENTRADAS)
+    : matchAll(lumps, abertos.map(a=>({...a})));
 
   const rows = [];
   const order = Object.keys(results).map(Number).sort((a,b)=> partsToDate(lumps[a].data)-partsToDate(lumps[b].data));
@@ -884,9 +984,13 @@ function processarBaixa(){
   unmatchedAbertos.sort((a,b)=> partsToDate(a.vencimento)-partsToDate(b.vencimento)).forEach(a=>{
     rows.push(buildRow(a, null, "err", "Sem correspondência no extrato"));
   });
+  const ambiguousList = ambiguous ? Object.keys(ambiguous).map(idxStr=>{
+    const idx = Number(idxStr);
+    return { data: lumps[idx].data, valor: lumps[idx].valor, candidatos: ambiguous[idxStr].map(c=>c.nome) };
+  }) : [];
 
   rowsState = rows;
-  renderResult(rows, unmatchedLumpIdx.map(i=>lumps[i]), contasState.empresaNome, contasState.empresaCnpj);
+  renderResult(rows, unmatchedLumpIdx.map(i=>lumps[i]), contasState.empresaNome, contasState.empresaCnpj, ambiguousList);
 }
 
 function buildRow(titulo, dataBaixa, statusClass, statusText){
@@ -957,8 +1061,8 @@ function findBestMatch(nome, db){
    RENDER — tabela de revisão editável + downloads
    ========================================================================= */
 let lastResultCtx = null;
-function renderResult(rows, semExtrato, empresaNome, empresaCnpj){
-  lastResultCtx = {semExtrato, empresaNome, empresaCnpj};
+function renderResult(rows, semExtrato, empresaNome, empresaCnpj, ambiguousList){
+  lastResultCtx = {semExtrato, empresaNome, empresaCnpj, ambiguousList};
   const box = document.getElementById("resultCard");
   box.classList.remove("hidden");
   const modelo = MODELOS[currentModelo];
@@ -977,7 +1081,9 @@ function renderResult(rows, semExtrato, empresaNome, empresaCnpj){
     <div class="item"><div class="k">Conferir</div><div class="v">${nWarn}</div></div>
     <div class="item"><div class="k">Pendente</div><div class="v">${nErr}</div></div>
     <div class="item"><div class="k">Extrato sem título</div><div class="v">${semExtrato.length}</div></div>
+    ${ambiguousList && ambiguousList.length ? `<div class="item"><div class="k">Ambíguos</div><div class="v">${ambiguousList.length}</div></div>` : ""}
   </div>
+  ${ambiguousList && ambiguousList.length ? `<div class="status-line err">Atenção: ${ambiguousList.length} pagamento(s) do extrato batem com o valor de títulos abertos de <b>mais de um fornecedor</b> — não escolhi nenhum sozinho pra não arriscar vincular a nota errada. Confira à mão: ${ambiguousList.map(a=>`${fmtDateBR(a.data)} ${fmtBRL(a.valor)} (${a.candidatos.join(" OU ")})`).join("; ")}</div>` : ""}
   <div class="help">Revise as linhas marcadas antes de baixar — campos são editáveis. Vermelho = falta CNPJ ou não achou o título no extrato; amarelo = casou mas com intervalo grande entre vencimento e crédito (conferir). A coluna <b>Incluir</b> decide o que entra no arquivo baixado — títulos sem correspondência no extrato começam <b>desmarcados</b> (ainda não têm uma baixa de verdade pra reportar); marque de novo se preencher a data/valor manualmente.</div>
   <div class="btn-row">
     <button class="btn ghost small" onclick="marcarTodos(true)">Marcar todos</button>
@@ -1048,7 +1154,7 @@ function removeRow(i){
 }
 function rerenderResult(){
   if(!lastResultCtx) return;
-  renderResult(rowsState, lastResultCtx.semExtrato, lastResultCtx.empresaNome, lastResultCtx.empresaCnpj);
+  renderResult(rowsState, lastResultCtx.semExtrato, lastResultCtx.empresaNome, lastResultCtx.empresaCnpj, lastResultCtx.ambiguousList);
 }
 function rowArray(r, modelo){
   const base = [r.numero, onlyDigits(r.cnpj), fmtDateBR(r.vencimento), fmtDateBR(r.databaixa), r.valor, r.juros, r.multa, r.desconto];
